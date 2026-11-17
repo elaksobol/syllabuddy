@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+syllabuddy/__init__.py
+syllabuddy/app.py
+syllabuddy/attendance.py
+syllabuddy/db.py
+syllabuddy/emailer.py
+syllabuddy/gemini_client.py
+syllabuddy/ics.py
+syllabuddy/schemas.py
+syllabuddy.egg-info/PKG-INFO
+syllabuddy.egg-info/SOURCES.txt
+syllabuddy.egg-info/dependency_links.txt
+syllabuddy.egg-info/requires.txt
+syllabuddy.egg-info/top_level.txt
+syllabuddy/templates/index.html
+tests/test_core.py

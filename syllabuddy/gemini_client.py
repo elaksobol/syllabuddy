@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from .schemas import FlashcardSet, SyllabusExtraction
 
-DEFAULT_MODEL = "gemini-2.5-flash"  # override with GEMINI_MODEL in .env
+DEFAULT_MODEL = "gemini-3.8-flash"  # override with GEMINI_MODEL in .env
 
 
 class GeminiError(RuntimeError):
