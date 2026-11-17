@@ -1,0 +1,23 @@
+[project]
+name = "syllabuddy"
+version = "0.1.0"
+description = "Turn course syllabi into an assignment tracker, calendar, attendance tracker and weekly email."
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0",
+    "google-genai>=1.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["syllabuddy"]
+
+[tool.setuptools.package-data]
+syllabuddy = ["templates/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
