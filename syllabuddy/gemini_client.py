@@ -4,10 +4,17 @@
 imported when a request is actually made, and parse/flashcard functions accept
 any object with a `generate_json(prompt, schema, pdf_bytes=None) -> str`
 method, so tests can pass a fake backend and never hit the network.
+
+Reliability: Google's newest models are sometimes overloaded (HTTP 503 "high
+demand"). Temporary errors (503, 429, 500, 504, timeouts, bad JSON) are retried
+with growing waits. Permanent errors (wrong model name, bad key) fail right away.
+If GEMINI_FALLBACK_MODEL is set, that model is tried after the main one gives up.
 """
 from __future__ import annotations
 
 import os
+import random
+import re
 import time
 from datetime import date
 
@@ -16,6 +23,12 @@ from pydantic import ValidationError
 from .schemas import FlashcardSet, SyllabusExtraction
 
 DEFAULT_MODEL = "gemini-3.8-flash"  # override with GEMINI_MODEL in .env
+MAX_ATTEMPTS = 5            # tries on the main model (waits ~2s, 4s, 8s, 16s + jitter)
+FALLBACK_ATTEMPTS = 3       # tries on the fallback model, if one is configured
+
+TRANSIENT_CODES = {408, 429, 500, 502, 503, 504}
+TRANSIENT_WORDS = ("unavailable", "overloaded", "high demand", "resource_exhausted",
+                   "deadline", "timed out", "timeout", "connection")
 
 
 class GeminiError(RuntimeError):
@@ -23,12 +36,15 @@ class GeminiError(RuntimeError):
 
 
 class GeminiBackend:
-    def __init__(self, api_key: str | None = None, model: str | None = None):
+    def __init__(self, api_key: str | None = None, model: str | None = None,
+                 fallback_model: str | None = None):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.model = model or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
+        self.fallback_model = fallback_model or os.environ.get("GEMINI_FALLBACK_MODEL") or None
         self._client = None
 
-    def generate_json(self, prompt: str, schema, pdf_bytes: bytes | None = None) -> str:
+    def generate_json(self, prompt: str, schema, pdf_bytes: bytes | None = None,
+                      model: str | None = None) -> str:
         if not self.api_key:
             raise GeminiError("GEMINI_API_KEY is not set (put it in your .env file).")
         from google import genai  # lazy import
@@ -41,7 +57,7 @@ class GeminiBackend:
             contents.append(types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"))
         contents.append(prompt)
         response = self._client.models.generate_content(
-            model=self.model,
+            model=model or self.model,
             contents=contents,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -55,24 +71,54 @@ class GeminiBackend:
         return text.replace(self.api_key, "***") if self.api_key else text
 
 
-def _generate_validated(backend, prompt, schema, pdf_bytes=None, max_attempts=3, sleep=time.sleep):
-    """Call Gemini, validate the JSON against `schema`, retry with backoff."""
-    last = None
+def _is_transient(exc: Exception) -> bool:
+    """True for 'try again in a bit' errors; False for ones retrying can't fix."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    if not isinstance(code, int):
+        m = re.match(r"\s*(\d{3})\b", text)  # google-genai errors read like "503 UNAVAILABLE. {...}"
+        code = int(m.group(1)) if m else None
+    if code is not None:
+        return code in TRANSIENT_CODES
+    return any(w in text for w in TRANSIENT_WORDS)
+
+
+def _run(backend, prompt, schema, pdf_bytes, model, max_attempts, sleep):
+    """Try up to `max_attempts` times. Returns (result, None) or (None, last_error_text).
+    Raises GeminiError immediately for permanent errors."""
+    last = "unknown error"
     for attempt in range(1, max_attempts + 1):
         try:
-            raw = backend.generate_json(prompt, schema, pdf_bytes=pdf_bytes)
-            return schema.model_validate_json(raw)
+            extra = {"model": model} if model else {}
+            raw = backend.generate_json(prompt, schema, pdf_bytes=pdf_bytes, **extra)
+            return schema.model_validate_json(raw), None
         except GeminiError:
-            raise  # config problems won't fix themselves
+            raise  # config problems (missing key) won't fix themselves
         except (ValidationError, ValueError) as e:
             last = f"Gemini returned invalid JSON: {e}"
-        except Exception as e:  # network, rate limit, 5xx ...
-            msg = str(e)
+        except Exception as e:
             redact = getattr(backend, "redact", None)
-            last = redact(msg) if redact else msg
+            last = redact(str(e)) if redact else str(e)
+            if not _is_transient(e):
+                raise GeminiError(f"Gemini request failed (not retrying): {last}") from e
         if attempt < max_attempts:
-            sleep(2 ** attempt)  # 2s, 4s, ...
-    raise GeminiError(f"Gemini failed after {max_attempts} attempts: {last}")
+            sleep(min(30, 2 ** attempt) + random.random())  # 2s, 4s, 8s, 16s ... plus jitter
+    return None, last
+
+
+def _generate_validated(backend, prompt, schema, pdf_bytes=None, max_attempts=MAX_ATTEMPTS,
+                        sleep=time.sleep):
+    result, last = _run(backend, prompt, schema, pdf_bytes, None, max_attempts, sleep)
+    if result is not None:
+        return result
+    fallback = getattr(backend, "fallback_model", None)
+    if fallback:
+        result, last2 = _run(backend, prompt, schema, pdf_bytes, fallback, FALLBACK_ATTEMPTS, sleep)
+        if result is not None:
+            return result
+        last = f"{last} | fallback model {fallback}: {last2}"
+    raise GeminiError("Gemini is busy right now (this is on Google's side, not yours). "
+                      f"Wait a minute and try again. Details: {last}")
 
 
 SYLLABUS_PROMPT = """You are extracting structured data from a college course syllabus (attached PDF).
@@ -104,7 +150,7 @@ NOTES:
 
 
 def parse_syllabus(pdf_bytes: bytes, backend=None, semester_year: int | None = None,
-                   max_attempts: int = 3, sleep=time.sleep) -> SyllabusExtraction:
+                   max_attempts: int = MAX_ATTEMPTS, sleep=time.sleep) -> SyllabusExtraction:
     backend = backend or GeminiBackend()
     today = date.today()
     prompt = SYLLABUS_PROMPT.format(today=today.isoformat(), year=semester_year or today.year)
@@ -113,7 +159,7 @@ def parse_syllabus(pdf_bytes: bytes, backend=None, semester_year: int | None = N
 
 
 def generate_flashcards(notes: str, title: str, course: str, backend=None, n: int = 12,
-                        max_attempts: int = 3, sleep=time.sleep) -> FlashcardSet:
+                        max_attempts: int = MAX_ATTEMPTS, sleep=time.sleep) -> FlashcardSet:
     backend = backend or GeminiBackend()
     prompt = FLASHCARD_PROMPT.format(title=title, course=course, n=n, notes=notes[:30000])
     return _generate_validated(backend, prompt, FlashcardSet,
